@@ -15,8 +15,8 @@
  * @wordpress-plugin
  * Plugin Name:       wsvd
  * Plugin URI:        https://acquistasitoweb.it/wsvd
- * Description:       Questo plugin permette di gestire i codici sconto applicati automaticamente
- * Version:           1.2.0
+ * Description:       Gestisce coupon automatici per email, sconti VIP e applicazione coupon cliente negli ordini manuali WooCommerce.
+ * Version:           1.3.0
  * Author:            Acqsuitasitoweb
  * Author URI:        https://acquistasitoweb.it/
  * License:           GPL-2.0+
@@ -32,10 +32,10 @@ if ( ! defined( 'WPINC' ) ) {
 
 /**
  * Currently plugin version.
- * Start at version 1.2.0 and use SemVer - https://semver.org
+ * Start at version 1.3.0 and use SemVer - https://semver.org
  * Rename this for your plugin and update it as you release new versions.
  */
-define( 'WSVD_VERSION', '1.2.0' );
+define( 'WSVD_VERSION', '1.3.0' );
 define( 'WSVD_PATH', plugin_dir_path( __FILE__ ) );
 define( 'WSVD_URL', plugin_dir_url( __FILE__ ) );
 
