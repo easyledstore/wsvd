@@ -2,6 +2,7 @@
 namespace WSVD\Modules;
 
 use WSVD\Module_Interface;
+use Automattic\WooCommerce\Internal\Orders\CouponsController;
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
@@ -147,11 +148,10 @@ class Module_Auto_Coupons implements Module_Interface {
 			'wsvd-admin',
 			'wsvdAdminAutoCoupons',
 			[
-				'ajaxUrl'        => admin_url( 'admin-ajax.php' ),
-				'nonce'          => wp_create_nonce( 'wsvd_apply_customer_auto_coupons' ),
-				'missingEmail'   => __( 'Inserisci prima l\'email del cliente.', 'wsvd' ),
-				'genericError'   => __( 'Non sono riuscito ad applicare i coupon automatici.', 'wsvd' ),
-				'refreshFallback'=> __( 'Coupon applicati. Se non li vedi subito, salva o ricarica l\'ordine.', 'wsvd' ),
+				'ajaxUrl'      => admin_url( 'admin-ajax.php' ),
+				'nonce'        => wp_create_nonce( 'wsvd_apply_customer_auto_coupons' ),
+				'missingEmail' => __( 'Inserisci prima l\'email del cliente.', 'wsvd' ),
+				'genericError' => __( 'Non sono riuscito ad applicare i coupon automatici.', 'wsvd' ),
 			]
 		);
 	}
@@ -170,7 +170,6 @@ class Module_Auto_Coupons implements Module_Interface {
 			<?php esc_html_e( 'Applica automaticamente i coupon del cliente', 'wsvd' ); ?>
 		</button>
 		<span class="spinner wsvd-apply-customer-coupons-spinner" style="float:none;margin:0 6px 0 0;"></span>
-		<span class="wsvd-apply-customer-coupons-feedback" aria-live="polite"></span>
 		<?php
 	}
 
@@ -212,11 +211,13 @@ class Module_Auto_Coupons implements Module_Interface {
 			);
 		}
 
-		if ( $email !== $order->get_billing_email() ) {
-			$order->set_billing_email( $email );
-		}
-
-		$result = $this->apply_auto_coupons_to_order( $order, $email );
+		$taxable_address = [
+			'country'  => isset( $_POST['country'] ) ? wc_clean( wp_unslash( $_POST['country'] ) ) : '',
+			'state'    => isset( $_POST['state'] ) ? wc_clean( wp_unslash( $_POST['state'] ) ) : '',
+			'postcode' => isset( $_POST['postcode'] ) ? wc_clean( wp_unslash( $_POST['postcode'] ) ) : '',
+			'city'     => isset( $_POST['city'] ) ? wc_clean( wp_unslash( $_POST['city'] ) ) : '',
+		];
+		$result          = $this->apply_customer_email_coupons_with_native_logic( $order, $email, $taxable_address );
 
 		if ( is_wp_error( $result ) ) {
 			wp_send_json_error(
@@ -229,11 +230,8 @@ class Module_Auto_Coupons implements Module_Interface {
 
 		wp_send_json_success(
 			[
-				'message'       => $this->build_admin_apply_message( $result ),
-				'applied'       => $result['applied'],
-				'removed'       => $result['removed'],
-				'ignored'       => $result['ignored'],
-				'shouldRefresh' => true,
+				'html'       => $result['html'],
+				'notes_html' => $result['notes_html'],
 			]
 		);
 	}
@@ -340,40 +338,29 @@ class Module_Auto_Coupons implements Module_Interface {
 		);
 	}
 
-	private function apply_auto_coupons_to_order( \WC_Order $order, $email ) {
-		$auto_coupon_ids = $this->get_auto_coupon_ids();
+	private function get_email_restricted_coupon_ids() {
+		return get_posts(
+			[
+				'post_type'   => 'shop_coupon',
+				'post_status' => 'publish',
+				'fields'      => 'ids',
+				'numberposts' => -1,
+			]
+		);
+	}
 
-		if ( empty( $auto_coupon_ids ) ) {
+	private function find_customer_email_coupon_codes( $email ) {
+		$coupon_ids = $this->get_email_restricted_coupon_ids();
+
+		if ( empty( $coupon_ids ) ) {
 			return [
-				'applied' => [],
-				'removed' => [],
-				'ignored' => [],
+				'matched' => [],
 			];
 		}
 
-		$applied_codes = [];
-		$added_codes   = [];
-		$removed_codes = [];
-		$ignored_codes = [];
+		$matched_codes = [];
 
-		foreach ( $order->get_items( 'coupon' ) as $item_id => $item ) {
-			$code   = $item->get_code();
-			$coupon = new \WC_Coupon( $code );
-
-			if ( 'yes' !== get_post_meta( $coupon->get_id(), '_wsvd_auto_apply', true ) ) {
-				continue;
-			}
-
-			if ( ! $this->email_allowed( $coupon, $email ) ) {
-				$order->remove_item( $item_id );
-				$removed_codes[] = $coupon->get_code();
-				continue;
-			}
-
-			$applied_codes[] = wc_strtolower( $coupon->get_code() );
-		}
-
-		foreach ( $auto_coupon_ids as $coupon_id ) {
+		foreach ( $coupon_ids as $coupon_id ) {
 			$coupon = new \WC_Coupon( $coupon_id );
 			$code   = $coupon->get_code();
 
@@ -381,63 +368,116 @@ class Module_Auto_Coupons implements Module_Interface {
 				continue;
 			}
 
-			if ( in_array( wc_strtolower( $code ), $applied_codes, true ) ) {
-				$ignored_codes[] = $code;
+			$matched_codes[] = $code;
+		}
+
+		return [
+			'matched' => $matched_codes,
+		];
+	}
+
+	private function apply_customer_email_coupons_with_native_logic( \WC_Order $order, $email, array $taxable_address ) {
+		$matched_codes  = $this->find_customer_email_coupon_codes( $email );
+		$coupon_codes   = isset( $matched_codes['matched'] ) ? $matched_codes['matched'] : [];
+		$applied_codes  = [];
+
+		foreach ( $order->get_items( 'coupon' ) as $item ) {
+			if ( is_callable( [ $item, 'get_code' ] ) ) {
+				$applied_codes[] = wc_strtolower( $item->get_code() );
+			}
+		}
+
+		if ( empty( $coupon_codes ) ) {
+			return [
+				'html'       => $this->render_order_items_html( $order ),
+				'notes_html' => $this->render_order_notes_html( $order ),
+			];
+		}
+
+		foreach ( $coupon_codes as $coupon_code ) {
+			if ( in_array( wc_strtolower( $coupon_code ), $applied_codes, true ) ) {
 				continue;
 			}
 
-			$result = $order->apply_coupon( $code );
+			$result = $this->apply_single_coupon_with_native_logic(
+				[
+					'order_id'   => $order->get_id(),
+					'coupon'     => $coupon_code,
+					'user_id'    => $order->get_customer_id(),
+					'user_email' => $email,
+					'country'    => $taxable_address['country'],
+					'state'      => $taxable_address['state'],
+					'postcode'   => $taxable_address['postcode'],
+					'city'       => $taxable_address['city'],
+				]
+			);
 
 			if ( is_wp_error( $result ) ) {
 				continue;
 			}
 
-			$applied_codes[] = wc_strtolower( $code );
-			$ignored_codes   = array_values( array_diff( $ignored_codes, [ $code ] ) );
-			$added_codes[]   = $code;
+			$order         = $result;
+			$applied_codes[] = wc_strtolower( $coupon_code );
 		}
 
-		$order->calculate_totals( false );
-		$order->save();
-
 		return [
-			'applied' => $added_codes,
-			'removed' => $removed_codes,
-			'ignored' => $ignored_codes,
+			'html'       => $this->render_order_items_html( $order ),
+			'notes_html' => $this->render_order_notes_html( $order ),
 		];
 	}
 
-	private function build_admin_apply_message( array $result ) {
-		$messages = [];
-
-		if ( ! empty( $result['applied'] ) ) {
-			$messages[] = sprintf(
-				/* translators: %s: comma-separated coupon codes */
-				__( 'Applicati: %s.', 'wsvd' ),
-				implode( ', ', $result['applied'] )
-			);
+	private function apply_single_coupon_with_native_logic( array $payload ) {
+		if ( class_exists( CouponsController::class ) && function_exists( 'wc_get_container' ) ) {
+			try {
+				return wc_get_container()->get( CouponsController::class )->add_coupon_discount( $payload );
+			} catch ( \Exception $e ) {
+				return new \WP_Error( 'wsvd_coupon_apply_failed', $e->getMessage() );
+			}
 		}
 
-		if ( ! empty( $result['removed'] ) ) {
-			$messages[] = sprintf(
-				/* translators: %s: comma-separated coupon codes */
-				__( 'Rimossi non piu validi: %s.', 'wsvd' ),
-				implode( ', ', $result['removed'] )
-			);
+		$order = wc_get_order( isset( $payload['order_id'] ) ? absint( $payload['order_id'] ) : 0 );
+
+		if ( ! $order ) {
+			return new \WP_Error( 'wsvd_invalid_order', __( 'Ordine non valido.', 'wsvd' ) );
 		}
 
-		if ( ! empty( $result['ignored'] ) ) {
-			$messages[] = sprintf(
-				/* translators: %s: comma-separated coupon codes */
-				__( 'Gia presenti: %s.', 'wsvd' ),
-				implode( ', ', $result['ignored'] )
-			);
+		if ( ! empty( $payload['user_id'] ) ) {
+			$order->set_customer_id( absint( $payload['user_id'] ) );
 		}
 
-		if ( empty( $messages ) ) {
-			return __( 'Nessun coupon automatico applicabile per questa email.', 'wsvd' );
+		if ( ! empty( $payload['user_email'] ) ) {
+			$order->set_billing_email( sanitize_email( $payload['user_email'] ) );
 		}
 
-		return implode( ' ', $messages );
+		$order->calculate_taxes(
+			[
+				'country'  => isset( $payload['country'] ) ? wc_strtoupper( $payload['country'] ) : '',
+				'state'    => isset( $payload['state'] ) ? wc_strtoupper( $payload['state'] ) : '',
+				'postcode' => isset( $payload['postcode'] ) ? wc_strtoupper( $payload['postcode'] ) : '',
+				'city'     => isset( $payload['city'] ) ? wc_strtoupper( $payload['city'] ) : '',
+			]
+		);
+		$order->calculate_totals( false );
+
+		$result = $order->apply_coupon( wc_format_coupon_code( $payload['coupon'] ) );
+
+		if ( is_wp_error( $result ) ) {
+			return $result;
+		}
+
+		return $order;
+	}
+
+	private function render_order_items_html( \WC_Order $order ) {
+		ob_start();
+		include WC()->plugin_path() . '/includes/admin/meta-boxes/views/html-order-items.php';
+		return ob_get_clean();
+	}
+
+	private function render_order_notes_html( \WC_Order $order ) {
+		ob_start();
+		$notes = wc_get_order_notes( [ 'order_id' => $order->get_id() ] );
+		include WC()->plugin_path() . '/includes/admin/meta-boxes/views/html-order-notes.php';
+		return ob_get_clean();
 	}
 }
